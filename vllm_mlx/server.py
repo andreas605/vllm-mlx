@@ -2310,12 +2310,25 @@ def _build_response_object(
     response_id: str | None = None,
 ) -> ResponseObject:
     """Build a full Responses API object."""
+    has_tool_output = any(
+        isinstance(item, (ResponseFunctionCallItem, ResponseCustomToolCallItem))
+        for item in output_items
+    )
     _FINISH_REASON_TO_STOP_REASON = {
         "stop": "end_turn",
         "tool_calls": "tool_use",
         "length": "max_tokens",
     }
-    stop_reason = _FINISH_REASON_TO_STOP_REASON.get(finish_reason) if finish_reason else None
+    if finish_reason == "length":
+        stop_reason = "max_tokens"
+    elif has_tool_output:
+        stop_reason = "tool_use"
+    else:
+        stop_reason = (
+            _FINISH_REASON_TO_STOP_REASON.get(finish_reason)
+            if finish_reason
+            else None
+        )
 
     response = ResponseObject(
         id=response_id or _new_response_item_id("resp"),

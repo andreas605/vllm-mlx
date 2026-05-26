@@ -545,6 +545,7 @@ class TestResponsesEndpoint:
         assert body["output"][0]["type"] == "function_call"
         assert body["output"][0]["name"] == "shell"
         assert body["output_text"] == ""
+        assert body["stop_reason"] == "tool_use"
 
     def test_store_false_skips_persistence(self, client):
         import vllm_mlx.server as srv
@@ -957,6 +958,7 @@ class TestCustomToolHandling:
         tool_output = body["output"][0]
         assert tool_output["type"] == "custom_tool_call"
         assert tool_output["name"] == "apply_patch"
+        assert body["stop_reason"] == "tool_use"
 
     def test_custom_tool_call_has_raw_string_input(self, client):
         """custom_tool_call has raw string input, not JSON arguments."""
@@ -990,6 +992,7 @@ class TestCustomToolHandling:
         # The input should be a raw string, not JSON
         assert tool_output["input"] == "diff --git a/foo.py b/foo.py"
         assert "arguments" not in tool_output
+        assert body["stop_reason"] == "tool_use"
 
     def test_custom_tool_call_output_in_continuation_input(self, client):
         """custom_tool_call_output in continuation input is accepted."""
@@ -1085,18 +1088,18 @@ class TestCustomToolHandling:
             for item in completed["response"]["output"]
             if item["type"] == "custom_tool_call"
         ]
-        # If tool parsing found the call, it should be custom_tool_call
-        if tool_outputs:
-            assert tool_outputs[0]["name"] == "apply_patch"
-            assert tool_outputs[0]["input"] == "diff content"
-            # Should NOT have function_call type for the bridged tool
-            function_outputs = [
-                item
-                for item in completed["response"]["output"]
-                if item["type"] == "function_call"
-                and item["name"] == "apply_patch"
-            ]
-            assert len(function_outputs) == 0
+        assert len(tool_outputs) == 1
+        assert tool_outputs[0]["name"] == "apply_patch"
+        assert tool_outputs[0]["input"] == "diff content"
+        assert completed["response"]["stop_reason"] == "tool_use"
+        # Should NOT have function_call type for the bridged tool
+        function_outputs = [
+            item
+            for item in completed["response"]["output"]
+            if item["type"] == "function_call"
+            and item["name"] == "apply_patch"
+        ]
+        assert len(function_outputs) == 0
 
     def test_mixed_custom_and_function_tools(self, client):
         """Custom and function tools can coexist in a single request."""

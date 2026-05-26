@@ -288,6 +288,52 @@ See [Installation Guide](docs/getting-started/installation.md) for full options.
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Fork: GLM-5.1 Codex Optimization (`feat/glm51-codex-optimization`)
+
+This fork adds Codex-native protocol support and GLM-5.1 optimizations for use as a local coding agent backend on Apple Silicon.
+
+### Codex Protocol Fixes
+
+Three gaps that previously required an external normalizer bridge are now handled natively:
+
+| Gap | Fix | Flag |
+|-----|-----|------|
+| Missing `end_turn` in Responses API | `stop_reason` field added to `ResponseObject` (`end_turn` / `tool_use` / `max_tokens`) | Always on |
+| Invalid tool schemas silently accepted | `validate_tool_definitions()` at request intake, returns 400 | Always on |
+| No native `custom_tool_call` support | Custom tools bridged internally, emitted as `custom_tool_call` with raw string input | Always on |
+
+### Safety & Output Discipline
+
+| Feature | Description | Flag |
+|---------|-------------|------|
+| Strict tool names | Filters model-generated tool calls whose names don't match defined tools | `--strict-tool-names` |
+| Fence stripping | Removes markdown code fences wrapping entire model output | `--strip-markdown-fences` |
+
+### GLM-5.1 Serving Example
+
+```bash
+vllm-mlx serve /path/to/glm-5.1 \
+  --port 18195 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm4 \
+  --strict-tool-names \
+  --strip-markdown-fences \
+  --specprefill \
+  --specprefill-draft-model mlx-community/Qwen3-0.6B-4bit \
+  --specprefill-threshold 8192
+```
+
+### Engine Optimizations
+
+- **System KV cache gate**: pre-computed at engine init (saves 2-5ms/request)
+- **Memory pressure polling**: configurable interval via `EngineConfig.memory_check_interval` (default 64, recommend 512 for 256GB+ systems)
+
+See [GLM-5.1 Optimization Guide](docs/guides/glm51-optimization.md) for full configuration details.
+
+### Test Coverage
+
+97 new tests across 3 test files, zero regressions against the 348 existing tests.
+
 ## Contributing
 
 Bug fixes, perf work, docs, and benchmarks on different Apple Silicon chips all welcome. See the [Contributing Guide](docs/development/contributing.md).

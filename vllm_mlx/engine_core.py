@@ -45,6 +45,11 @@ class EngineConfig:
     step_interval: float = 0.001  # 1ms between steps
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
+    # How many scheduler steps between mx.get_active_memory() polls.
+    # Default of 64 suits 24–96 GB systems. High-memory Apple Silicon (256 GB+,
+    # e.g. M3 Ultra Mac Studio) can safely use 256 or 512 to reduce the polling
+    # overhead without meaningful risk of missing a pressure event.
+    memory_check_interval: int = 64
 
 
 class EngineCore:
@@ -235,7 +240,7 @@ class EngineCore:
             )
         except Exception:
             _memory_pressure_threshold = 200 * 1024 * 1024 * 1024
-        _memory_check_interval = 64
+        _memory_check_interval = self.config.memory_check_interval
 
         try:
             while self._running:

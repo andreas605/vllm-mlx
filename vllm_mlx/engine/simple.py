@@ -196,6 +196,15 @@ class SimpleEngine(BaseEngine):
         # restore would silently desynchronize. Probed once in ``start()``.
         self._supports_system_kv_cache: bool = False
 
+        # Pre-computed engine-level gate for the system KV cache branch.
+        # Combines all conditions that are invariant after ``start()`` completes
+        # (model probe result, MTP flag, SpecPrefill draft model, max_kv_size).
+        # Set to True only when none of those engine features block the cache
+        # path; re-evaluated at the end of ``start()`` and reset in ``stop()``.
+        # Per-request conditions (specprefill override, stop tokens,
+        # logits_processors, sampling knobs) are still checked per request.
+        self._system_kv_cache_eligible: bool = False
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -368,6 +377,31 @@ class SimpleEngine(BaseEngine):
                     "For full MTP support, use: --enable-mtp --continuous-batching"
                 )
 
+            # Compute the engine-level system KV cache gate once, after all
+            # model loading and probing is complete. This avoids re-evaluating
+            # these invariant conditions on every stream_chat call.
+            self._system_kv_cache_eligible = (
+                self._supports_system_kv_cache
+                and not self._mtp
+                and self._draft_model is None
+                and (self._max_kv_size or 0) == 0
+            )
+            if not self._system_kv_cache_eligible:
+                reasons = []
+                if not self._supports_system_kv_cache:
+                    reasons.append("non_kv_cache_class")
+                if self._mtp:
+                    reasons.append("mtp")
+                if self._draft_model is not None:
+                    reasons.append("specprefill_loaded")
+                if (self._max_kv_size or 0) > 0:
+                    reasons.append("max_kv_size")
+                logger.debug(
+                    "System KV cache engine gate: DISABLED (%s); "
+                    "stream_chat will use uncached path for all requests",
+                    reasons,
+                )
+
             mtp_info = ""
             if self._mtp:
                 mtp_info = (
@@ -397,6 +431,7 @@ class SimpleEngine(BaseEngine):
         self._system_kv_hash = None
         self._system_kv_token_count = 0
         self._supports_system_kv_cache = False
+        self._system_kv_cache_eligible = False
         logger.info("SimpleEngine stopped")
 
     def _should_route_text_through_text_model(
@@ -1015,21 +1050,13 @@ class SimpleEngine(BaseEngine):
         #   - ``self._max_kv_size`` (when > 0) caps the prompt cache; the cache
         #     branch builds its cache with ``make_prompt_cache(model)`` and has
         #     no equivalent bound.
-        if self._mtp:
-            cache_blocking_controls.append("mtp")
-        if self._draft_model is not None:
-            cache_blocking_controls.append("specprefill_loaded")
+        # Engine-level features (MTP, SpecPrefill, max_kv_size, KV cache class)
+        # are invariant after start() and pre-computed into _system_kv_cache_eligible.
+        # Only the per-request specprefill override is checked here.
+        if not self._system_kv_cache_eligible:
+            cache_blocking_controls.append("engine_gate")
         if kwargs.get("specprefill") is not None:
             cache_blocking_controls.append("specprefill_request_override")
-        if (self._max_kv_size or 0) > 0:
-            cache_blocking_controls.append("max_kv_size")
-        # Sliding-window models build their prompt cache from RotatingKVCache
-        # entries whose ``.state`` aliases buffers that ``update_and_fetch``
-        # mutates in place. Snapshot capture would corrupt the cached prefix
-        # on the next decode. Probed once at start; ``False`` if the model
-        # exposes any non-KVCache entries or the probe failed.
-        if not self._supports_system_kv_cache:
-            cache_blocking_controls.append("non_kv_cache_class")
 
         if cache_blocking_controls:
             logger.info(

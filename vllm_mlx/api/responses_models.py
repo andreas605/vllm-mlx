@@ -108,6 +108,33 @@ class ResponseFunctionTool(BaseModel):
     strict: bool = False
 
 
+class ResponseCustomTool(BaseModel):
+    """A custom tool definition (freeform string input, not JSON schema)."""
+
+    type: Literal["custom"] = "custom"
+    name: str
+    description: str | None = None
+
+
+class ResponseCustomToolCallItem(BaseModel):
+    """A custom tool call output item (raw string input, not JSON arguments)."""
+
+    id: str | None = None
+    type: Literal["custom_tool_call"] = "custom_tool_call"
+    name: str
+    input: str  # Raw string input, not JSON
+    call_id: str | None = None
+    status: str = "completed"
+
+
+class ResponseCustomToolCallOutputItem(BaseModel):
+    """A tool result item for custom tool calls."""
+
+    type: Literal["custom_tool_call_output"] = "custom_tool_call_output"
+    call_id: str
+    output: str  # Raw string output
+
+
 class ResponsesInputTokenDetails(BaseModel):
     """Input token breakdown."""
 
@@ -158,13 +185,15 @@ class ResponsesRequest(BaseModel):
             | ResponseReasoningItem
             | ResponseFunctionCallItem
             | ResponseFunctionCallOutputItem
+            | ResponseCustomToolCallItem
+            | ResponseCustomToolCallOutputItem
             | dict
         ]
     )
     instructions: str | None = None
     max_output_tokens: int | None = None
     stream: bool = False
-    tools: list[ResponseFunctionTool | dict] = Field(default_factory=list)
+    tools: list[ResponseFunctionTool | ResponseCustomTool | dict] = Field(default_factory=list)
     tool_choice: str | dict | None = "auto"
     parallel_tool_calls: bool = True
     previous_response_id: str | None = None
@@ -195,18 +224,19 @@ class ResponseObject(BaseModel):
     metadata: dict = Field(default_factory=dict)
     model: str
     output: list[
-        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem | ResponseCustomToolCallItem
     ] = Field(default_factory=list)
     parallel_tool_calls: bool = True
     previous_response_id: str | None = None
     text: ResponseTextConfig = Field(default_factory=ResponseTextConfig)
     tool_choice: str | dict | None = "auto"
-    tools: list[ResponseFunctionTool | dict] = Field(default_factory=list)
+    tools: list[ResponseFunctionTool | ResponseCustomTool | dict] = Field(default_factory=list)
     top_p: float = 1.0
     temperature: float | None = None
     truncation: str = "disabled"
     usage: ResponsesUsage | None = None
     user: str | None = None
+    stop_reason: str | None = None
     store: bool = True
 
     @computed_field
@@ -250,13 +280,13 @@ class ResponseCompletedEvent(ResponsesEventBase):
 class ResponseOutputItemAddedEvent(ResponsesEventBase):
     type: Literal["response.output_item.added"] = "response.output_item.added"
     output_index: int
-    item: ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    item: ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem | ResponseCustomToolCallItem
 
 
 class ResponseOutputItemDoneEvent(ResponsesEventBase):
     type: Literal["response.output_item.done"] = "response.output_item.done"
     output_index: int
-    item: ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    item: ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem | ResponseCustomToolCallItem
 
 
 class ResponseContentPartAddedEvent(ResponsesEventBase):

@@ -110,6 +110,9 @@ from .api.responses_models import (
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseCustomTool,
+    ResponseCustomToolCallItem,
+    ResponseCustomToolCallOutputItem,
     ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallItem,
     ResponseFunctionCallOutputItem,
@@ -137,6 +140,7 @@ from .api.tool_calling import (
     convert_tools_for_template,
     parse_json_output,
     parse_tool_calls,
+    validate_tool_definitions,
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
@@ -1786,17 +1790,28 @@ def _response_content_to_text(content) -> str:
 
 
 def _responses_tools_to_chat_tools(
-    tools: list[ResponseFunctionTool | dict],
-) -> tuple[list[dict] | None, list[str]]:
-    """Convert supported Responses tools and report unsupported tool types."""
+    tools: list[ResponseFunctionTool | ResponseCustomTool | dict],
+) -> tuple[list[dict] | None, list[str], dict[str, bool]]:
+    """Convert supported Responses tools and report unsupported tool types.
+
+    Returns (chat_tools, unsupported_type_names, custom_tool_map).
+    ``custom_tool_map`` tracks which tool names were bridged from custom tools
+    so that output items can be emitted as ``custom_tool_call`` instead of
+    ``function_call``.
+    """
     if not tools:
-        return None, []
+        return None, [], {}
 
     supported: list[dict] = []
     unsupported: list[str] = []
+    custom_tool_map: dict[str, bool] = {}
 
     for tool in tools:
-        if isinstance(tool, ResponseFunctionTool):
+        if isinstance(tool, ResponseCustomTool):
+            tool_type = "custom"
+            tool_name = tool.name
+            tool_description = tool.description or ""
+        elif isinstance(tool, ResponseFunctionTool):
             tool_type = tool.type
             tool_name = tool.name
             tool_description = tool.description or ""
@@ -1810,7 +1825,26 @@ def _responses_tools_to_chat_tools(
             unsupported.append(type(tool).__name__)
             continue
 
-        if tool_type == "function":
+        if tool_type == "custom":
+            # Bridge custom tools as function tools with a single string
+            # ``input`` parameter.  The response path converts these back to
+            # ``custom_tool_call`` items.
+            supported.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"input": {"type": "string"}},
+                            "required": ["input"],
+                        },
+                    },
+                }
+            )
+            custom_tool_map[tool_name] = True
+        elif tool_type == "function":
             supported.append(
                 {
                     "type": "function",
@@ -1825,7 +1859,7 @@ def _responses_tools_to_chat_tools(
         else:
             unsupported.append(tool_type)
 
-    return supported or None, unsupported
+    return supported or None, unsupported, custom_tool_map
 
 
 def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
@@ -1888,6 +1922,37 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                         "content": item.get("output", ""),
                     }
                 )
+            elif item_type == "custom_tool_call":
+                # Bridge custom tool call as a function call internally
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": item.get(
+                                    "call_id", _new_response_item_id("call")
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": json.dumps(
+                                        {"input": item.get("input", "")}
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif item_type == "custom_tool_call_output":
+                # Bridge custom tool call output as function_call_output
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    }
+                )
             elif item_type == "reasoning":
                 parts = item.get("content", [])
                 reasoning_text = "\n".join(
@@ -1929,6 +1994,33 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                 }
             )
         elif isinstance(item, ResponseFunctionCallOutputItem):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.call_id,
+                    "content": item.output,
+                }
+            )
+        elif isinstance(item, ResponseCustomToolCallItem):
+            # Bridge custom tool call as function call internally
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": item.call_id or _new_response_item_id("call"),
+                            "type": "function",
+                            "function": {
+                                "name": item.name,
+                                "arguments": json.dumps({"input": item.input}),
+                            },
+                        }
+                    ],
+                }
+            )
+        elif isinstance(item, ResponseCustomToolCallOutputItem):
+            # Bridge custom tool call output as function_call_output
             messages.append(
                 {
                     "role": "tool",
@@ -1981,8 +2073,11 @@ def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[
 
 def _responses_request_to_chat_request(
     request: ResponsesRequest,
-) -> ChatCompletionRequest:
-    """Build a ChatCompletionRequest from a ResponsesRequest."""
+) -> tuple[ChatCompletionRequest, dict[str, bool]]:
+    """Build a ChatCompletionRequest from a ResponsesRequest.
+
+    Returns (chat_request, custom_tool_map).
+    """
     if request.text.format.type == "json_object":
         raise HTTPException(
             status_code=400,
@@ -1991,7 +2086,9 @@ def _responses_request_to_chat_request(
     if request.reasoning is not None:
         logger.debug("Ignoring reasoning configuration (not supported on this backend)")
 
-    tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
+    tools, unsupported_tools, custom_tool_map = _responses_tools_to_chat_tools(
+        request.tools
+    )
     messages = _responses_input_to_chat_messages(request)
     if unsupported_tools:
         tool_list = ", ".join(sorted(set(unsupported_tools)))
@@ -2019,7 +2116,7 @@ def _responses_request_to_chat_request(
         else []
     ) + non_system_messages
 
-    return ChatCompletionRequest(
+    chat_request = ChatCompletionRequest(
         model=request.model,
         messages=[Message(**msg) for msg in messages],
         temperature=request.temperature,
@@ -2030,16 +2127,32 @@ def _responses_request_to_chat_request(
         tool_choice=request.tool_choice,
         chat_template_kwargs=request.chat_template_kwargs,
     )
+    return chat_request, custom_tool_map
 
 
 def _build_responses_output_items(
     text: str | None,
     reasoning: str | None,
     tool_calls: list[ToolCall] | None,
-) -> list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem]:
-    """Convert parsed assistant output into Responses API output items."""
+    custom_tool_map: dict[str, bool] | None = None,
+) -> list[
+    ResponseMessageItem
+    | ResponseReasoningItem
+    | ResponseFunctionCallItem
+    | ResponseCustomToolCallItem
+]:
+    """Convert parsed assistant output into Responses API output items.
+
+    When a tool call's name appears in *custom_tool_map*, emit a
+    ``ResponseCustomToolCallItem`` (with raw string ``input``) instead of
+    the default ``ResponseFunctionCallItem``.
+    """
+    custom_tool_map = custom_tool_map or {}
     output_items: list[
-        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+        ResponseMessageItem
+        | ResponseReasoningItem
+        | ResponseFunctionCallItem
+        | ResponseCustomToolCallItem
     ] = []
 
     if reasoning:
@@ -2060,14 +2173,30 @@ def _build_responses_output_items(
         )
 
     for tool_call in tool_calls or []:
-        output_items.append(
-            ResponseFunctionCallItem(
-                id=_new_response_item_id("fc"),
-                call_id=tool_call.id,
-                name=tool_call.function.name,
-                arguments=tool_call.function.arguments,
+        if tool_call.function.name in custom_tool_map:
+            # Extract the raw ``input`` string from the bridged JSON arguments.
+            try:
+                raw_input = json.loads(tool_call.function.arguments).get("input", "")
+            except (json.JSONDecodeError, TypeError):
+                raw_input = tool_call.function.arguments
+            output_items.append(
+                ResponseCustomToolCallItem(
+                    id=_new_response_item_id("ctc"),
+                    call_id=tool_call.id,
+                    name=tool_call.function.name,
+                    input=raw_input,
+                    status="completed",
+                )
             )
-        )
+        else:
+            output_items.append(
+                ResponseFunctionCallItem(
+                    id=_new_response_item_id("fc"),
+                    call_id=tool_call.id,
+                    name=tool_call.function.name,
+                    arguments=tool_call.function.arguments,
+                )
+            )
 
     return output_items
 
@@ -2080,6 +2209,18 @@ def _response_output_items_to_chat_messages(output_items: list) -> list[dict]:
     for item in output_items:
         if isinstance(item, ResponseMessageItem):
             assistant_text_parts.append(_response_content_to_text(item.content))
+        elif isinstance(item, ResponseCustomToolCallItem):
+            # Persist custom tool calls as function calls internally
+            assistant_tool_calls.append(
+                {
+                    "id": item.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.name,
+                        "arguments": json.dumps({"input": item.input}),
+                    },
+                }
+            )
         elif isinstance(item, ResponseFunctionCallItem):
             assistant_tool_calls.append(
                 {
@@ -2107,7 +2248,10 @@ def _response_output_items_to_chat_messages(output_items: list) -> list[dict]:
 def _build_response_object(
     request: ResponsesRequest,
     output_items: list[
-        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+        ResponseMessageItem
+        | ResponseReasoningItem
+        | ResponseFunctionCallItem
+        | ResponseCustomToolCallItem
     ],
     prompt_tokens: int,
     completion_tokens: int,
@@ -2115,6 +2259,13 @@ def _build_response_object(
     response_id: str | None = None,
 ) -> ResponseObject:
     """Build a full Responses API object."""
+    _FINISH_REASON_TO_STOP_REASON = {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+    }
+    stop_reason = _FINISH_REASON_TO_STOP_REASON.get(finish_reason) if finish_reason else None
+
     response = ResponseObject(
         id=response_id or _new_response_item_id("resp"),
         model=_model_name or request.model,
@@ -2131,6 +2282,7 @@ def _build_response_object(
         temperature=_resolve_temperature(request.temperature),
         truncation=request.truncation,
         user=request.user,
+        stop_reason=stop_reason,
         store=request.store,
         usage=ResponsesUsage(
             input_tokens=prompt_tokens,
@@ -2150,11 +2302,14 @@ def _prepare_responses_request(
     request: ResponsesRequest,
     *,
     validate_remote_media: bool = True,
-) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
-    """Prepare a Responses request for execution on the chat engine."""
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict, dict[str, bool]]:
+    """Prepare a Responses request for execution on the chat engine.
+
+    Returns (engine, chat_request, messages, chat_kwargs, custom_tool_map).
+    """
     _validate_model_name(request.model)
     engine = get_engine()
-    chat_request = _responses_request_to_chat_request(request)
+    chat_request, custom_tool_map = _responses_request_to_chat_request(request)
 
     if chat_request.messages:
         logger.info(
@@ -2189,12 +2344,12 @@ def _prepare_responses_request(
     if videos:
         chat_kwargs["videos"] = videos
 
-    return engine, chat_request, messages, chat_kwargs
+    return engine, chat_request, messages, chat_kwargs, custom_tool_map
 
 
 def _prepare_streaming_responses_request(
     request: ResponsesRequest,
-) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict, dict[str, bool]]:
     """Prepare a streaming Responses request after eager URL validation."""
     return _prepare_responses_request(request, validate_remote_media=False)
 
@@ -2204,7 +2359,9 @@ async def _run_responses_request(
     raw_request: Request,
 ) -> tuple[ResponseObject | None, list[dict]]:
     """Execute a Responses API request against the backend chat engine."""
-    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    engine, chat_request, messages, chat_kwargs, custom_tool_map = (
+        _prepare_responses_request(request)
+    )
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
@@ -2233,6 +2390,7 @@ async def _run_responses_request(
         clean_output_text(cleaned_text) if cleaned_text else None,
         reasoning_text,
         tool_calls,
+        custom_tool_map=custom_tool_map,
     )
     response_object = _build_response_object(
         request=request,
@@ -2257,8 +2415,8 @@ async def _run_responses_request(
 
 async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
-    engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
-        request
+    engine, chat_request, messages, chat_kwargs, custom_tool_map = (
+        _prepare_streaming_responses_request(request)
     )
 
     response_id = _new_response_item_id("resp")
@@ -2592,48 +2750,98 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         )
         sequence += 1
 
-    function_call_items: list[ResponseFunctionCallItem] = []
+    function_call_items: list[
+        ResponseFunctionCallItem | ResponseCustomToolCallItem
+    ] = []
     for tool_call in tool_calls or []:
         output_index = next_output_index
         next_output_index += 1
-        item = ResponseFunctionCallItem(
-            id=_new_response_item_id("fc"),
-            call_id=tool_call.id,
-            name=tool_call.function.name,
-            arguments=tool_call.function.arguments,
-        )
-        function_call_items.append(item)
-        yield _responses_sse_event(
-            "response.output_item.added",
-            ResponseOutputItemAddedEvent(
-                sequence_number=sequence,
-                output_index=output_index,
-                item=item.model_copy(update={"status": "in_progress"}),
-            ),
-        )
-        sequence += 1
-        yield _responses_sse_event(
-            "response.function_call_arguments.delta",
-            ResponseFunctionCallArgumentsDeltaEvent(
-                sequence_number=sequence,
-                item_id=item.id,
-                output_index=output_index,
-                delta=item.arguments,
-            ),
-        )
-        sequence += 1
-        yield _responses_sse_event(
-            "response.output_item.done",
-            ResponseOutputItemDoneEvent(
-                sequence_number=sequence,
-                output_index=output_index,
-                item=item,
-            ),
-        )
-        sequence += 1
+
+        if tool_call.function.name in custom_tool_map:
+            # Emit as custom_tool_call instead of function_call
+            try:
+                raw_input = json.loads(tool_call.function.arguments).get("input", "")
+            except (json.JSONDecodeError, TypeError):
+                raw_input = tool_call.function.arguments
+            item = ResponseCustomToolCallItem(
+                id=_new_response_item_id("ctc"),
+                call_id=tool_call.id,
+                name=tool_call.function.name,
+                input=raw_input,
+                status="completed",
+            )
+            function_call_items.append(item)
+            yield _responses_sse_event(
+                "response.output_item.added",
+                ResponseOutputItemAddedEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item.model_copy(update={"status": "in_progress"}),
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.custom_tool_call.delta",
+                {
+                    "type": "response.custom_tool_call.delta",
+                    "sequence_number": sequence,
+                    "item_id": item.id,
+                    "output_index": output_index,
+                    "delta": raw_input,
+                },
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                ResponseOutputItemDoneEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item,
+                ),
+            )
+            sequence += 1
+        else:
+            item = ResponseFunctionCallItem(
+                id=_new_response_item_id("fc"),
+                call_id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+            )
+            function_call_items.append(item)
+            yield _responses_sse_event(
+                "response.output_item.added",
+                ResponseOutputItemAddedEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item.model_copy(update={"status": "in_progress"}),
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.function_call_arguments.delta",
+                ResponseFunctionCallArgumentsDeltaEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.arguments,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                ResponseOutputItemDoneEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item,
+                ),
+            )
+            sequence += 1
 
     output_items: list[
-        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+        ResponseMessageItem
+        | ResponseReasoningItem
+        | ResponseFunctionCallItem
+        | ResponseCustomToolCallItem
     ] = []
     if reasoning_item is not None:
         output_items.append(reasoning_item)
@@ -4633,6 +4841,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     _validate_model_name(request.model)
+
+    # Validate tool definitions before any processing
+    if request.tools:
+        try:
+            validate_tool_definitions(request.tools)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     effective_max_tokens = _resolve_request_max_tokens(request.max_tokens)
     tracker = _metrics.track_inference("chat_completions", stream=request.stream)
     total_timeout, deadline = _start_request_budget(request.timeout)
@@ -4866,9 +5082,16 @@ def _get_engine_tokenizer(engine) -> object | None:
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
+    # Validate tool definitions before any processing
+    if request.tools:
+        try:
+            validate_tool_definitions(request.tools)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         if request.stream:
-            chat_request = _responses_request_to_chat_request(request)
+            chat_request, _custom_map = _responses_request_to_chat_request(request)
             _validate_remote_media_urls(chat_request.messages)
             return StreamingResponse(
                 _disconnect_guard(_stream_responses_request(request), raw_request),

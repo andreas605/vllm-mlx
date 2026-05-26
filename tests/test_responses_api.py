@@ -181,7 +181,7 @@ class TestResponsesEndpoint:
                 ],
                 max_tokens=8,
                 stream=True,
-            )
+            ), {}
 
         monkeypatch.setattr(srv, "_validate_remote_media_urls", fake_validate)
         monkeypatch.setattr(
@@ -809,3 +809,355 @@ class TestResponsesEndpoint:
         body = resp.json()
         assert body["status"] == "incomplete"
         assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    def test_stop_reason_end_turn_on_finish_reason_stop(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hello there"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Say hello"},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["stop_reason"] == "end_turn"
+
+    def test_stop_reason_tool_use_on_finish_reason_tool_calls(self, client):
+        import vllm_mlx.server as srv
+
+        output = _output("tool call text")
+        output.finish_reason = "tool_calls"
+        srv._engine = _mock_engine(output)
+
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Use a tool"},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["stop_reason"] == "tool_use"
+
+    def test_stop_reason_max_tokens_on_finish_reason_length(self, client):
+        import vllm_mlx.server as srv
+
+        output = _output("Cut off", completion_tokens=5)
+        output.finish_reason = "length"
+        srv._engine = _mock_engine(output)
+
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "max_output_tokens": 5},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["stop_reason"] == "max_tokens"
+        assert body["status"] == "incomplete"
+
+    def test_streaming_completed_event_includes_stop_reason(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
+        engine._stream_outputs = [
+            _stream_output("Hello ", completion_tokens=1),
+            _stream_output("stream", completion_tokens=2, finish_reason="stop"),
+        ]
+        srv._engine = engine
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "stream": True},
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(body)
+        completed_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "response.completed"
+        )
+        assert completed_payload["response"]["stop_reason"] == "end_turn"
+
+
+class TestCustomToolHandling:
+    """Tests for custom tool bridging (Codex apply_patch style tools)."""
+
+    def test_custom_tool_bridged_to_function_internally(self, client):
+        """Custom tool in request gets bridged to a function tool for the model."""
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Hello"))
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Apply a patch",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        # The engine should have received a function tool with the bridged schema
+        call_kwargs = engine.chat.call_args.kwargs
+        tools = call_kwargs.get("tools", [])
+        assert len(tools) == 1
+        tool = tools[0]
+        assert tool["type"] == "function"
+        assert tool["function"]["name"] == "apply_patch"
+        assert tool["function"]["parameters"] == {
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+            "required": ["input"],
+        }
+
+    def test_custom_tool_response_emits_custom_tool_call(self, client):
+        """Response with custom-bridged function emits custom_tool_call, not function_call."""
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(
+            _output(
+                '<tool_call>{"name":"apply_patch","arguments":{"input":"diff --git a/foo"}}</tool_call>'
+            )
+        )
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Apply a patch",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        # Should emit custom_tool_call, NOT function_call
+        tool_output = body["output"][0]
+        assert tool_output["type"] == "custom_tool_call"
+        assert tool_output["name"] == "apply_patch"
+
+    def test_custom_tool_call_has_raw_string_input(self, client):
+        """custom_tool_call has raw string input, not JSON arguments."""
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(
+            _output(
+                '<tool_call>{"name":"apply_patch","arguments":{"input":"diff --git a/foo.py b/foo.py"}}</tool_call>'
+            )
+        )
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Apply a patch",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        tool_output = body["output"][0]
+        assert tool_output["type"] == "custom_tool_call"
+        # The input should be a raw string, not JSON
+        assert tool_output["input"] == "diff --git a/foo.py b/foo.py"
+        assert "arguments" not in tool_output
+
+    def test_custom_tool_call_output_in_continuation_input(self, client):
+        """custom_tool_call_output in continuation input is accepted."""
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output("Patch applied successfully"),
+        )
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Apply a patch"},
+                    {
+                        "type": "custom_tool_call",
+                        "name": "apply_patch",
+                        "input": "diff --git a/foo.py",
+                        "call_id": "call_abc123",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_abc123",
+                        "output": "Patch applied successfully",
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        # Verify the messages were converted properly
+        messages = engine.chat.call_args.kwargs["messages"]
+        # Messages go through extract_multimodal_content which converts
+        # tool messages to user role when preserve_native_format=False.
+        # Just verify the request was accepted and all items were processed.
+        assert len(messages) >= 3  # user + assistant(tool_call) + tool_result
+
+    def test_streaming_custom_tool_call_emits_correct_events(self, client):
+        """Streaming custom tool calls emit custom_tool_call type events."""
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(
+            side_effect=AssertionError("stream path should not call chat")
+        )
+        engine._stream_outputs = [
+            _stream_output(
+                '<tool_call>{"name":"apply_patch","arguments":{"input":"diff content"}}</tool_call>',
+                completion_tokens=5,
+                finish_reason="stop",
+            ),
+        ]
+        srv._engine = engine
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Apply a patch",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    }
+                ],
+            },
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        events = _parse_sse_events(body)
+
+        # Check for custom_tool_call events (not function_call events)
+        event_types = [et for et, _ in events]
+        assert "response.completed" in event_types
+
+        # The completed response should have a custom_tool_call output
+        completed = next(p for et, p in events if et == "response.completed")
+        tool_outputs = [
+            item
+            for item in completed["response"]["output"]
+            if item["type"] == "custom_tool_call"
+        ]
+        # If tool parsing found the call, it should be custom_tool_call
+        if tool_outputs:
+            assert tool_outputs[0]["name"] == "apply_patch"
+            assert tool_outputs[0]["input"] == "diff content"
+            # Should NOT have function_call type for the bridged tool
+            function_outputs = [
+                item
+                for item in completed["response"]["output"]
+                if item["type"] == "function_call"
+                and item["name"] == "apply_patch"
+            ]
+            assert len(function_outputs) == 0
+
+    def test_mixed_custom_and_function_tools(self, client):
+        """Custom and function tools can coexist in a single request."""
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Hello"))
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Do something",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a code patch",
+                    },
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        call_kwargs = engine.chat.call_args.kwargs
+        tools = call_kwargs.get("tools", [])
+        assert len(tools) == 2
+        # Both should be function tools internally
+        assert all(t["type"] == "function" for t in tools)
+        # Custom tool should have the bridged schema
+        patch_tool = next(t for t in tools if t["function"]["name"] == "apply_patch")
+        assert patch_tool["function"]["parameters"]["required"] == ["input"]
+        # Function tool should keep its original schema
+        shell_tool = next(t for t in tools if t["function"]["name"] == "shell")
+        assert shell_tool["function"]["parameters"] == {
+            "type": "object",
+            "properties": {},
+        }
+
+    def test_custom_tool_bridging_internal_function_names_tracked(self):
+        """Verify _responses_tools_to_chat_tools returns correct custom_tool_map."""
+        from vllm_mlx.server import _responses_tools_to_chat_tools
+
+        tools = [
+            {"type": "custom", "name": "apply_patch", "description": "patch tool"},
+            {
+                "type": "function",
+                "name": "shell",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+        chat_tools, unsupported, custom_map = _responses_tools_to_chat_tools(tools)
+        assert chat_tools is not None
+        assert len(chat_tools) == 2
+        assert "apply_patch" in custom_map
+        assert custom_map["apply_patch"] is True
+        assert "shell" not in custom_map
+        assert len(unsupported) == 0

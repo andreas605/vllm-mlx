@@ -343,6 +343,79 @@ def parse_tool_calls(
     return cleaned_text, tool_calls if tool_calls else None
 
 
+def validate_tool_definitions(tools: List[dict]) -> None:
+    """
+    Validate incoming tool definitions for structural correctness.
+
+    Checks each tool in the list for required fields and valid types:
+    - ``function.name`` must be a non-empty string
+    - If ``function.parameters`` is present, it must be a dict with
+      ``"type": "object"``
+    - If ``function.parameters.properties`` is present, it must be a dict
+
+    Args:
+        tools: List of tool definition dicts (OpenAI or Responses format).
+
+    Raises:
+        ValueError: On any structural violation, with a clear message
+            identifying the offending tool.
+    """
+    for i, tool in enumerate(tools):
+        # Skip unsupported tool types (e.g. web_search_preview, file_search)
+        # that don't follow the function tool schema.
+        if isinstance(tool, dict):
+            tool_type = tool.get("type", "")
+            if tool_type not in ("function", "custom", ""):
+                continue
+        else:
+            tool_type = getattr(tool, "type", "")
+            if tool_type not in ("function", "custom", ""):
+                continue
+
+        # Normalise: Responses API tools have name/parameters at top level;
+        # Chat Completions API nests them under ``function``.
+        if isinstance(tool, dict):
+            func = tool.get("function", tool)
+        else:
+            func = getattr(tool, "function", None)
+            if func is None:
+                func = tool
+
+        # --- function as a whole must be a dict (or Pydantic model) ---
+        if isinstance(func, dict):
+            name = func.get("name")
+            parameters = func.get("parameters")
+        else:
+            name = getattr(func, "name", None)
+            parameters = getattr(func, "parameters", None)
+
+        # --- function.name ---
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"Tool at index {i}: function.name must be a non-empty string, "
+                f"got {name!r}"
+            )
+
+        # --- function.parameters (optional) ---
+        if parameters is not None:
+            if not isinstance(parameters, dict):
+                raise ValueError(
+                    f"Tool '{name}' (index {i}): function.parameters must be a "
+                    f"dict, got {type(parameters).__name__}"
+                )
+            if parameters.get("type") != "object":
+                raise ValueError(
+                    f"Tool '{name}' (index {i}): function.parameters.type must "
+                    f"be 'object', got {parameters.get('type')!r}"
+                )
+            properties = parameters.get("properties")
+            if properties is not None and not isinstance(properties, dict):
+                raise ValueError(
+                    f"Tool '{name}' (index {i}): function.parameters.properties "
+                    f"must be a dict, got {type(properties).__name__}"
+                )
+
+
 def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.

@@ -1996,12 +1996,24 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                     }
                 )
             elif item_type == "custom_tool_call_output":
+                call_id = item.get("call_id")
+                output = item.get("output")
+                if not isinstance(call_id, str) or not call_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="custom_tool_call_output.call_id must be a non-empty string",
+                    )
+                if not isinstance(output, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="custom_tool_call_output.output must be a string",
+                    )
                 # Bridge custom tool call output as function_call_output
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": item.get("call_id", ""),
-                        "content": item.get("output", ""),
+                        "tool_call_id": call_id,
+                        "content": output,
                     }
                 )
             elif item_type == "reasoning":

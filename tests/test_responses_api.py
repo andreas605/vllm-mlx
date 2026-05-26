@@ -1039,6 +1039,53 @@ class TestCustomToolHandling:
         # Just verify the request was accepted and all items were processed.
         assert len(messages) >= 3  # user + assistant(tool_call) + tool_result
 
+    def test_custom_tool_call_output_missing_call_id_fails_closed(self, client):
+        """custom_tool_call_output must not be accepted without a call_id."""
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("unused"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {
+                        "type": "custom_tool_call_output",
+                        "output": "Patch applied successfully",
+                    },
+                ],
+                "max_output_tokens": 8,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "custom_tool_call_output.call_id" in resp.json()["detail"]
+
+    def test_custom_tool_call_output_non_string_output_fails_closed(self, client):
+        """custom_tool_call_output output must be a string."""
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("unused"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_abc123",
+                        "output": {"ok": True},
+                    },
+                ],
+                "max_output_tokens": 8,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "custom_tool_call_output.output" in resp.json()["detail"]
+
     def test_streaming_custom_tool_call_emits_correct_events(self, client):
         """Streaming custom tool calls emit custom_tool_call type events."""
         import vllm_mlx.server as srv

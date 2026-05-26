@@ -109,6 +109,10 @@ def serve_command(args):
     else:
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
+    server._strict_tool_names = getattr(args, "strict_tool_names", False)
+
+    # Configure output post-processing
+    server._strip_markdown_fences = getattr(args, "strip_markdown_fences", False)
 
     # Configure generation defaults
     if args.default_temperature is not None:
@@ -190,6 +194,8 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
+    if args.strict_tool_names:
+        print("  Strict tool names: ENABLED (reject unknown tool names)")
     if args.reasoning_parser:
         print(f"  Reasoning: ENABLED (parser: {args.reasoning_parser})")
     else:
@@ -200,6 +206,8 @@ def serve_command(args):
         f"  Audio upload limit: {max_audio_upload_mb} MiB, "
         f"TTS input limit: {max_tts_input_chars} chars"
     )
+    if getattr(args, "strip_markdown_fences", False):
+        print("  Strip markdown fences: ENABLED")
     print("=" * 60)
 
     # Pre-download model with retry/timeout
@@ -1329,6 +1337,12 @@ Examples:
         help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
     )
     serve_parser.add_argument(
+        "--strict-tool-names",
+        action="store_true",
+        help="Reject model-generated tool calls whose names don't match any tool "
+        "in the request's tool list. Filtered calls are dropped with a warning.",
+    )
+    serve_parser.add_argument(
         "--tool-call-parser",
         type=str,
         default=None,
@@ -1372,6 +1386,19 @@ Examples:
             "Enable reasoning content extraction with specified parser. "
             "Extracts <think>...</think> tags into reasoning_content field. "
             f"Options: {', '.join(reasoning_choices)}."
+        ),
+    )
+    # Output post-processing
+    serve_parser.add_argument(
+        "--strip-markdown-fences",
+        action="store_true",
+        default=False,
+        help=(
+            "Strip markdown code fences (```...```) from model output before "
+            "returning it. Useful when models like GLM-5.1 wrap structured "
+            "output (JSON, patches) in fences that cause downstream parsing "
+            "failures. Only applies to requests without tools defined; when "
+            "tools are present the tool parser handles formatting. (default: disabled)"
         ),
     )
     # Multimodal option

@@ -54,6 +54,7 @@ def _serve_args(**overrides):
         "specprefill_keep_pct": 0.3,
         "specprefill_threshold": 8192,
         "stream_interval": 1,
+        "strict_tool_names": False,
         "tool_call_parser": None,
         "timeout": 300,
         "lazy_load_model": False,

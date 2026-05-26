@@ -173,6 +173,7 @@ from .model_registry import (
 from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import get_parser as get_reasoning_parser
+from .text_processing import strip_markdown_fences as _strip_markdown_fences_fn
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
 
 logging.basicConfig(level=logging.INFO)
@@ -875,6 +876,10 @@ def _thinking_disabled(request, chat_kwargs: dict | None = None) -> bool:
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+_strict_tool_names: bool = False  # Reject tool calls with names not in request tools
+
+# Output post-processing
+_strip_markdown_fences: bool = False  # Strip markdown code fences from model output
 _responses_store: OrderedDict[str, dict] = OrderedDict()
 _RESPONSES_STORE_MAX_SIZE: int = 1000
 
@@ -1764,6 +1769,52 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
+def _filter_tool_calls_by_name(
+    tool_calls: list[ToolCall] | None,
+    request,
+) -> list[ToolCall] | None:
+    """Filter tool calls against the request's defined tool names.
+
+    When ``_strict_tool_names`` is enabled and the request carries a tools
+    list, any tool call whose ``function.name`` does not appear in that list
+    is silently dropped (with a warning log).  If every tool call is filtered
+    out, ``None`` is returned so the caller treats the response as text-only.
+    """
+    if not _strict_tool_names or not tool_calls:
+        return tool_calls
+
+    # Collect the set of valid tool names from the request
+    tools = getattr(request, "tools", None)
+    if not tools:
+        return tool_calls
+
+    valid_names: set[str] = set()
+    for tool_def in tools:
+        if isinstance(tool_def, dict):
+            fn = tool_def.get("function", {})
+            name = fn.get("name") if isinstance(fn, dict) else None
+        else:
+            fn = getattr(tool_def, "function", None)
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+        if name:
+            valid_names.add(name)
+
+    if not valid_names:
+        return tool_calls
+
+    filtered = []
+    for tc in tool_calls:
+        if tc.function.name in valid_names:
+            filtered.append(tc)
+        else:
+            logger.warning(
+                "strict-tool-names: filtered tool call '%s' not in defined tools",
+                tc.function.name,
+            )
+
+    return filtered if filtered else None
+
+
 def _new_response_item_id(prefix: str) -> str:
     """Generate stable OpenAI-style item ids."""
     return f"{prefix}_{uuid.uuid4().hex}"
@@ -2373,6 +2424,7 @@ async def _run_responses_request(
         return None, []
 
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    tool_calls = _filter_tool_calls_by_name(tool_calls, chat_request)
     reasoning_text = None
     if _reasoning_parser:
         reasoning_text, remaining_text = _reasoning_parser.extract_reasoning(
@@ -2664,6 +2716,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(
         raw_accumulated_text, chat_request
     )
+    tool_calls = _filter_tool_calls_by_name(tool_calls, chat_request)
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
         final_text = clean_output_text(cleaned_text)
@@ -2930,6 +2983,8 @@ def _extract_reasoning_and_tool_calls(
             )
     else:
         cleaned_text, tool_calls = text_for_tool_parse, None
+
+    tool_calls = _filter_tool_calls_by_name(tool_calls, request)
 
     return reasoning_text, cleaned_text, tool_calls
 
@@ -4952,6 +5007,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             engine=engine,
         )
 
+        # Strip markdown code fences when --strip-markdown-fences is enabled
+        # and the request has no tools (tool parser handles its own formatting).
+        if _strip_markdown_fences and not tool_calls and not request.tools:
+            source = cleaned_text if cleaned_text is not None else output.text
+            cleaned_text = _strip_markdown_fences_fn(source)
+
         # Process response_format if specified (after reasoning parser cleaned the text)
         if prepared.response_format and not tool_calls:
             json_input = cleaned_text or output.text
@@ -5821,6 +5882,7 @@ async def _stream_anthropic_messages(
             openai_request,
             engine=engine,
         )
+        tool_calls = _filter_tool_calls_by_name(tool_calls, openai_request)
 
         # Close text block
         if text_block_started:
@@ -6024,6 +6086,8 @@ async def stream_chat_completion(
     # via ``parse_json_output``; without this, streaming clients see
     # ``"```json{...}```"`` instead of ``"{...}"`` for models that wrap
     # their structured output in markdown (e.g. Gemma 4).
+    # Also activated when --strip-markdown-fences server option is set and
+    # the request has no tools defined.
     fence_stripper: StreamingJsonFenceStripper | None = None
     _rf = getattr(request, "response_format", None)
     _rf_type = None
@@ -6031,7 +6095,10 @@ async def stream_chat_completion(
         _rf_type = getattr(_rf, "type", None)
         if _rf_type is None and isinstance(_rf, dict):
             _rf_type = _rf.get("type")
-    if _rf_type in ("json_object", "json_schema"):
+    _no_tools_for_stream = not getattr(request, "tools", None)
+    if _rf_type in ("json_object", "json_schema") or (
+        _strip_markdown_fences and _no_tools_for_stream
+    ):
         fence_stripper = StreamingJsonFenceStripper()
 
     # Tool call streaming state
@@ -6131,7 +6198,6 @@ async def stream_chat_completion(
 
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
-                            tool_calls_detected = True
                             # Coerce arguments against tool schemas
                             if tools_dict:
                                 for tc in tool_result["tool_calls"]:
@@ -6140,6 +6206,30 @@ async def stream_chat_completion(
                                         fn["arguments"] = _coerce_tool_arguments(
                                             fn["arguments"], fn["name"], tools_dict
                                         )
+                            # Apply strict tool name filtering
+                            if _strict_tool_names and getattr(request, "tools", None):
+                                _valid = set()
+                                for _td in request.tools:
+                                    _fn_def = _td.get("function", {}) if isinstance(_td, dict) else getattr(_td, "function", {})
+                                    _n = _fn_def.get("name") if isinstance(_fn_def, dict) else getattr(_fn_def, "name", None)
+                                    if _n:
+                                        _valid.add(_n)
+                                _kept = []
+                                for tc in tool_result["tool_calls"]:
+                                    _fn = tc.get("function", {})
+                                    _name = _fn.get("name", "")
+                                    if _name in _valid:
+                                        _kept.append(tc)
+                                    else:
+                                        logger.warning(
+                                            "strict-tool-names: filtered tool call '%s' not in defined tools",
+                                            _name,
+                                        )
+                                tool_result["tool_calls"] = _kept
+                            if not tool_result["tool_calls"]:
+                                # All tool calls filtered out — skip emission
+                                continue
+                            tool_calls_detected = True
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
@@ -6234,7 +6324,6 @@ async def stream_chat_completion(
 
                         if "tool_calls" in tool_result:
                             # Emit structured tool calls
-                            tool_calls_detected = True
                             # Coerce arguments against tool schemas
                             if tools_dict:
                                 for tc in tool_result["tool_calls"]:
@@ -6243,6 +6332,30 @@ async def stream_chat_completion(
                                         fn["arguments"] = _coerce_tool_arguments(
                                             fn["arguments"], fn["name"], tools_dict
                                         )
+                            # Apply strict tool name filtering
+                            if _strict_tool_names and getattr(request, "tools", None):
+                                _valid = set()
+                                for _td in request.tools:
+                                    _fn_def = _td.get("function", {}) if isinstance(_td, dict) else getattr(_td, "function", {})
+                                    _n = _fn_def.get("name") if isinstance(_fn_def, dict) else getattr(_fn_def, "name", None)
+                                    if _n:
+                                        _valid.add(_n)
+                                _kept = []
+                                for tc in tool_result["tool_calls"]:
+                                    _fn = tc.get("function", {})
+                                    _name = _fn.get("name", "")
+                                    if _name in _valid:
+                                        _kept.append(tc)
+                                    else:
+                                        logger.warning(
+                                            "strict-tool-names: filtered tool call '%s' not in defined tools",
+                                            _name,
+                                        )
+                                tool_result["tool_calls"] = _kept
+                            if not tool_result["tool_calls"]:
+                                # All tool calls filtered out — skip emission
+                                continue
+                            tool_calls_detected = True
                             chunk = ChatCompletionChunk(
                                 id=response_id,
                                 model=_response_model_name(request.model),
@@ -6304,34 +6417,53 @@ async def stream_chat_completion(
         ):
             final_parse_result = tool_parser.extract_tool_calls(tool_accumulated_text)
             if final_parse_result.tools_called:
-                tool_chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=_response_model_name(request.model),
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            delta=ChatCompletionChunkDelta(
-                                tool_calls=[
-                                    {
-                                        "index": i,
-                                        "id": tc["id"],
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc["name"],
-                                            "arguments": _coerce_tool_arguments(
-                                                tc["arguments"], tc["name"], tools_dict
-                                            ),
-                                        },
-                                    }
-                                    for i, tc in enumerate(
-                                        final_parse_result.tool_calls
-                                    )
-                                ]
+                _fallback_tcs = [
+                    {
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": _coerce_tool_arguments(
+                                tc["arguments"], tc["name"], tools_dict
                             ),
-                            finish_reason="tool_calls",
-                        )
-                    ],
-                )
-                yield f"data: {tool_chunk.model_dump_json()}\n\n"
+                        },
+                    }
+                    for i, tc in enumerate(final_parse_result.tool_calls)
+                ]
+                # Apply strict tool name filtering
+                if _strict_tool_names and getattr(request, "tools", None):
+                    _valid = set()
+                    for _td in request.tools:
+                        _fn_def = _td.get("function", {}) if isinstance(_td, dict) else getattr(_td, "function", {})
+                        _n = _fn_def.get("name") if isinstance(_fn_def, dict) else getattr(_fn_def, "name", None)
+                        if _n:
+                            _valid.add(_n)
+                    _filtered = []
+                    for tc in _fallback_tcs:
+                        _name = tc.get("function", {}).get("name", "")
+                        if _name in _valid:
+                            _filtered.append(tc)
+                        else:
+                            logger.warning(
+                                "strict-tool-names: filtered tool call '%s' not in defined tools",
+                                _name,
+                            )
+                    _fallback_tcs = _filtered
+                if _fallback_tcs:
+                    tool_chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=_response_model_name(request.model),
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=_fallback_tcs,
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                    )
+                    yield f"data: {tool_chunk.model_dump_json()}\n\n"
 
         # Safety-net validation: if response_format was requested, verify the
         # accumulated output still parses.  When constrained decoding is active
